@@ -41,7 +41,17 @@ cat > "${ENT}" <<'EOF'
 </dict>
 </plist>
 EOF
-codesign --force --deep --sign - --entitlements "${ENT}" "${APP_BUNDLE}"
+# Prefer the user's Apple Development cert if present so macOS keeps grants
+# (Accessibility, Bluetooth, etc.) stable across rebuilds. Falls back to ad-hoc.
+SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null \
+    | grep -oE '"Apple Development:[^"]*"' | head -1 | sed 's/"//g')
+if [[ -z "${SIGN_ID}" ]]; then
+    SIGN_ID="-"  # ad-hoc
+    echo "==> codesigning ad-hoc (no Apple Development cert found)"
+else
+    echo "==> codesigning with: ${SIGN_ID}"
+fi
+codesign --force --deep --sign "${SIGN_ID}" --entitlements "${ENT}" "${APP_BUNDLE}"
 
 echo
 echo "Built: ${APP_BUNDLE}"

@@ -102,6 +102,15 @@ final class Bridge: ObservableObject {
         hasAccessibility = EventInjector.ensureAccessibility(prompt: true)
     }
 
+    /// Releases every key we might have held down, stops the auto-accept
+    /// timer, and asks the device to flip its LED off so the device's switch
+    /// state mirrors what the host now expects.
+    func emergencyStop() {
+        injector.panicReleaseAll()
+        ble.send(["cmd": "led", "mode": "off"])
+        NSLog("[Bridge] EMERGENCY STOP")
+    }
+
     private func handle(_ obj: [String: Any]) {
         if let evt = obj["evt"] as? String {
             switch evt {
@@ -150,10 +159,28 @@ struct MenuView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 9, height: 9)
                 MenuBarIconView(state: bridge.iconState)
-                Text(statusText)
-                    .bold()
+                Text(statusText).bold()
             }
+
+            // Big red EMERGENCY STOP — released stuck keys + stops auto-accept.
+            Button(action: { bridge.emergencyStop() }) {
+                HStack {
+                    Image(systemName: "stop.circle.fill")
+                    Text("Emergency Stop").bold()
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 4)
+                .background(Color.red.opacity(0.18))
+                .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.escape)
+            .help("Release all held keys, stop auto-accept timer, clear stuck modifiers.")
+
             if let id = bridge.ble.deviceIdentifier {
                 Text("device: \(id.uuidString.prefix(8))…")
                     .font(.caption.monospaced())
@@ -164,6 +191,17 @@ struct MenuView: View {
                     .font(.caption.monospaced())
                     .lineLimit(2)
                     .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 12) {
+                Label(bridge.hasAccessibility ? "Keys" : "No Keys",
+                      systemImage: bridge.hasAccessibility ? "keyboard" : "keyboard.badge.eye")
+                    .font(.caption)
+                    .foregroundStyle(bridge.hasAccessibility ? .green : .red)
+                Label(bridge.httpRunning ? "MCP" : "MCP off",
+                      systemImage: bridge.httpRunning ? "network" : "network.slash")
+                    .font(.caption)
+                    .foregroundStyle(bridge.httpRunning ? .green : .red)
             }
 
             Divider()
@@ -198,6 +236,15 @@ struct MenuView: View {
         }
         .padding(12)
         .frame(width: 260)
+    }
+
+    private var statusColor: Color {
+        switch bridge.ble.status {
+        case .connected:                       return .green
+        case .connecting, .scanning:           return .orange
+        case .disconnected, .unknown:          return .gray
+        case .poweredOff, .unauthorized:       return .red
+        }
     }
 
     private var statusText: String {
