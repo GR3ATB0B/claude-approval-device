@@ -53,8 +53,8 @@ Requires:
 ```bash
 arduino-cli core install esp32:esp32@3.3.8
 arduino-cli lib install "NimBLE-Arduino" "HijelHID_BLEKeyboard" "ArduinoJson"
-arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3 .
-arduino-cli upload  -p /dev/cu.usbmodem101 --fqbn esp32:esp32:XIAO_ESP32S3 .
+arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3 claude_approval_device
+arduino-cli upload  -p /dev/cu.usbmodem101 --fqbn esp32:esp32:XIAO_ESP32S3 claude_approval_device
 ```
 
 ## Pair
