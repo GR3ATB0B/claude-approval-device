@@ -1,21 +1,30 @@
 /*
- * Claude Code Approval Device - BLE HID (HijelHID library)
- * Hardware: XIAO ESP32-S3
+ * Claude Code Approval Device
+ * Hardware: Seeed Studio XIAO ESP32-S3
  *
- * BLE keyboard via HijelHID_BLEKeyboard (NimBLE 2.x stack).
- * Pair "ClaudeApprover" in Mac Bluetooth settings.
+ * BLE HID keyboard (paired with macOS/iOS/Android/Windows/Linux as
+ * "ClaudeApprover"). Three physical inputs:
  *
- * WIRING (XIAO ESP32-S3 silkscreen):
- *   D0 - Function button -> GND
- *   D1 - Return button   -> GND
- *   D2 - Auto-accept switch -> GND
- *   D5 - Buzzer S pin
- *   D8 - Blue LED (inverted: LOW = on)
+ *   D0 - Function button -> sends Ctrl+Option+F19  (Wispr Flow trigger)
+ *   D1 - Return button   -> sends Enter
+ *   D2 - Auto-accept switch (latching) -> spams Enter every 1s while ON
  *
- * Requirements:
- *   ESP32 Arduino Core 3.3.8
- *   NimBLE-Arduino 2.5.0
- *   HijelHID_BLEKeyboard 0.5.0
+ * Plus visual + audio status (controllable from Mac via USB serial):
+ *
+ *   D5 - Passive buzzer (jingles + tones)
+ *   D8 - Blue LED (PWM, inverted: LOW = on, breathing/pulsing/solid/flash)
+ *
+ * USB serial control channel (115200 baud). Mac's MCP server pushes commands:
+ *
+ *   STATUS:BREATHING|PULSING|SOLID|FLASH|OFF
+ *   TONE:<freq_hz>,<duration_ms>
+ *   JINGLE:startup|approved|denied|thinking|waiting
+ *
+ * Build:
+ *   ESP32 Arduino Core 3.3.7+
+ *   NimBLE-Arduino 2.3.8+
+ *   HijelHID_BLEKeyboard 0.5.0+
+ *   FQBN: esp32:esp32:XIAO_ESP32S3
  */
 
 #include <HijelHID_BLEKeyboard.h>
@@ -52,7 +61,7 @@ String commandBuffer = "";
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n[ClaudeApprover-BLE] boot");
+  Serial.println("\n[ClaudeApprover] boot");
 
   pinMode(PIN_FUNC_BTN, INPUT_PULLUP);
   pinMode(PIN_RETURN_BTN, INPUT_PULLUP);
@@ -63,7 +72,7 @@ void setup() {
 
   keyboard.setLogLevel(HIDLogLevel::Normal);
   keyboard.begin();
-  Serial.println("[ClaudeApprover-BLE] BLE advertising as 'ClaudeApprover'");
+  Serial.println("[ClaudeApprover] BLE advertising as 'ClaudeApprover'");
 
   playJingle("startup");
   currentLEDStatus = LED_BREATHING;
@@ -75,13 +84,6 @@ void loop() {
   bool funcState = digitalRead(PIN_FUNC_BTN);
   bool returnState = digitalRead(PIN_RETURN_BTN);
   bool switchState = digitalRead(PIN_AUTO_SWITCH);
-
-  static unsigned long lastDbg = 0;
-  if (millis() - lastDbg > 2000) {
-    lastDbg = millis();
-    Serial.printf("[DBG] FUNC=%d RET=%d SW=%d paired=%d\n",
-                  funcState, returnState, switchState, keyboard.isPaired());
-  }
 
   if (switchState != lastSwitchState) {
     if (switchState == LOW) {
@@ -101,7 +103,6 @@ void loop() {
   if (switchState == LOW && keyboard.isPaired()) {
     if (millis() - lastAutoSpam >= autoSpamInterval) {
       keyboard.tap(KEY_RETURN);
-      Serial.println("Auto-spam: RETURN");
       lastAutoSpam = millis();
       digitalWrite(PIN_LED, LOW);
       delay(10);
@@ -109,11 +110,11 @@ void loop() {
     }
   }
 
-  // Function button -> Ctrl+Option+F19 (Wispr Flow trigger, 3-key combo)
+  // Function button -> Ctrl+Option+F19 (3-key combo, fits Wispr Flow's limit)
   if (funcState == LOW && lastFuncState == HIGH &&
       (millis() - lastFuncPress > debounceDelay)) {
     lastFuncPress = millis();
-    Serial.printf("FUNCTION pressed (paired=%d)\n", keyboard.isPaired());
+    Serial.println("FUNCTION pressed");
     if (keyboard.isPaired()) {
       keyboard.press(KEY_F19, KEY_MOD_LCTRL | KEY_MOD_LALT);
     }
@@ -130,7 +131,7 @@ void loop() {
   if (returnState == LOW && lastReturnState == HIGH &&
       (millis() - lastReturnPress > debounceDelay)) {
     lastReturnPress = millis();
-    Serial.printf("RETURN pressed (paired=%d)\n", keyboard.isPaired());
+    Serial.println("RETURN pressed");
     if (keyboard.isPaired()) {
       keyboard.tap(KEY_RETURN);
     }
@@ -161,7 +162,7 @@ void handleSerialCommands() {
 
 void processCommand(String cmd) {
   cmd.trim();
-  Serial.print("Command: ");
+  Serial.print("[CMD] ");
   Serial.println(cmd);
 
   if (cmd.startsWith("STATUS:")) {
