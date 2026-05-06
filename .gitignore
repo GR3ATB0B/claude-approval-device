@@ -7,3 +7,4 @@ mcp-server/.venv/
 menubar-app/.build/
 menubar-app/.swiftpm/
 menubar-app/Package.resolved
+menubar-app/build/
