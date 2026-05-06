@@ -33,13 +33,60 @@ struct ClaudeApproverApp: App {
 final class Bridge: ObservableObject {
     let ble = BLEController()
     let injector = EventInjector()
+    private var httpServer: LocalHTTPServer?
 
     @Published var hasAccessibility: Bool = false
+    @Published var httpRunning: Bool = false
 
     init() {
         hasAccessibility = EventInjector.ensureAccessibility(prompt: false)
         ble.onEvent = { [weak self] obj in self?.handle(obj) }
         ble.start()
+        startHTTPServer()
+    }
+
+    private func startHTTPServer() {
+        let server = LocalHTTPServer { [weak self] method, path, body in
+            self?.handleHTTP(method: method, path: path, body: body) ?? (404, Data())
+        }
+        do {
+            try server.start()
+            httpServer = server
+            DispatchQueue.main.async { self.httpRunning = true }
+        } catch {
+            NSLog("[HTTP] failed to start: \(error)")
+        }
+    }
+
+    private func handleHTTP(method: String, path: String, body: Data) -> (Int, Data) {
+        let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:]
+        switch (method, path) {
+        case ("GET", "/status"):
+            let payload: [String: Any] = [
+                "connected": ble.status == .connected,
+                "ble_status": String(describing: ble.status),
+                "device_id": ble.deviceIdentifier?.uuidString ?? "",
+                "last_event": ble.lastIncomingLine
+            ]
+            return (200, jsonData(payload))
+        case ("POST", "/led"):
+            ble.send(["cmd": "led", "mode": json["mode"] as? String ?? "breathing"])
+            return (200, jsonData(["ok": true]))
+        case ("POST", "/jingle"):
+            ble.send(["cmd": "jingle", "name": json["name"] as? String ?? "startup"])
+            return (200, jsonData(["ok": true]))
+        case ("POST", "/tone"):
+            let freq = json["freq"] as? Int ?? 1000
+            let ms = json["ms"] as? Int ?? 100
+            ble.send(["cmd": "tone", "freq": freq, "ms": ms])
+            return (200, jsonData(["ok": true]))
+        default:
+            return (404, jsonData(["error": "unknown route"]))
+        }
+    }
+
+    private func jsonData(_ obj: [String: Any]) -> Data {
+        (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
     }
 
     var iconName: String {
