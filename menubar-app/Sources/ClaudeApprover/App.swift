@@ -23,7 +23,7 @@ struct ClaudeApproverApp: App {
         MenuBarExtra {
             MenuView(bridge: bridge)
         } label: {
-            Image(systemName: bridge.iconName)
+            MenuBarIconView(state: bridge.iconState)
         }
         .menuBarExtraStyle(.window)
     }
@@ -89,15 +89,12 @@ final class Bridge: ObservableObject {
         (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
     }
 
-    var iconName: String {
+    var iconState: IconState {
         switch ble.status {
-        case .connected:    return "flame.fill"
-        case .connecting:   return "flame"
-        case .scanning:     return "magnifyingglass.circle"
-        case .disconnected: return "flame.circle"
-        case .poweredOff:   return "exclamationmark.triangle"
-        case .unauthorized: return "lock"
-        case .unknown:      return "questionmark.circle"
+        case .connected:                       return .connected
+        case .connecting, .scanning:           return .connecting
+        case .disconnected, .unknown:          return .disconnected
+        case .poweredOff, .unauthorized:       return .warning
         }
     }
 
@@ -153,7 +150,7 @@ struct MenuView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Image(systemName: bridge.iconName)
+                MenuBarIconView(state: bridge.iconState)
                 Text(statusText)
                     .bold()
             }
