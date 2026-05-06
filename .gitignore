@@ -4,3 +4,6 @@ __pycache__/
 mcp-server/.venv/
 .DS_Store
 *.swp
+menubar-app/.build/
+menubar-app/.swiftpm/
+menubar-app/Package.resolved
