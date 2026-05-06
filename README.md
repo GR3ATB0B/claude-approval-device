@@ -3,80 +3,126 @@
 A small wireless dongle for approving Claude Code prompts and triggering voice
 dictation. Built on a Seeed Studio XIAO ESP32-S3.
 
-The device runs **three** transports out of one firmware:
+```
+   buttons / switch   ┌──────────┐    BLE NUS    ┌────────────────┐  CGEvent
+  ─────────────────►  │ ESP32-S3 │  ───────────► │  Menu-bar app  │ ─────────► focused window
+                      │ firmware │  ◄─────────── │     (Swift)    │            (Terminal, etc.)
+   LED / buzzer       └──────────┘  led/jingle   └─────────┬──────┘
+                                                            │ HTTP localhost:47823
+                                                            ▼
+                                                  ┌──────────────────┐
+                                                  │  MCP shim (uv)   │ ◄── Claude Code CLI
+                                                  └──────────────────┘ ◄── Claude Desktop
+```
 
-| Surface                | What it does                                                                                  |
-|------------------------|-----------------------------------------------------------------------------------------------|
-| **BLE HID keyboard**   | Pairs as `ClaudeApprover`. Return button = Enter, Auto-Accept switch = Enter spam, Function button = `Ctrl+Option+F19` (Wispr Flow). Works for terminal Claude Code, any text field. |
-| **Hardware Buddy NUS** | Same BLE peripheral also implements Anthropic's [Claude Desktop Buddy](https://github.com/anthropics/claude-desktop-buddy) wire protocol. When connected via Claude Desktop's Developer → Open Hardware Buddy panel, heartbeats drive the LED and Function button sends a structured `permission:once` decision keyed to the active prompt. No keyboard-focus race. |
-| **USB serial MCP**     | Plug in the cable, run the bundled MCP server, and Claude can drive LED status + buzzer jingles directly. |
+The device is a generic BLE peripheral, not a system HID keyboard. Apple
+deliberately hides system-bonded HID peripherals from third-party apps, so the
+firmware advertises only the Nordic UART Service (the same wire format
+[Anthropic uses for Claude Desktop's Hardware Buddy panel](https://github.com/anthropics/claude-desktop-buddy)).
+The menu-bar app owns the BLE bond and translates physical button presses into
+keystrokes via Quartz Event Services.
 
-## Inputs / outputs
+## Hardware
 
-| Pin (silkscreen) | Component             | Notes                                                |
-|------------------|-----------------------|------------------------------------------------------|
-| D0               | Function button       | Buddy approve when prompt active, else `Ctrl+Opt+F19` |
-| D1               | Return button         | sends Enter via HID                                  |
-| D2               | Auto-accept switch    | spams Enter via HID + auto-approves Buddy prompts    |
-| D5               | Passive piezo buzzer  | middle pin → 3.3V, − → GND, S → D5                   |
-| D8               | Blue LED (PWM)        | anode → 3.3V, cathode → D8 (inverted, LOW = on)      |
+| Pin (silkscreen) | Component             | Notes                                               |
+|------------------|-----------------------|-----------------------------------------------------|
+| D0               | Function button       | Wispr Flow trigger / Buddy approve while prompting |
+| D1               | Return button         | sends Enter via CGEvent                             |
+| D2               | Auto-accept switch    | spams Enter every 1s while ON / auto-approves Buddy prompts |
+| D5               | Passive piezo buzzer  | middle pin → 3.3V, − → GND, S → D5                  |
+| D8               | Blue LED (PWM)        | anode → 3.3V, cathode → D8 (inverted, LOW = on)     |
 
-## Behaviour summary
-
-When **Hardware Buddy is connected**, the LED reflects what Claude Desktop is doing:
-
-- prompt waiting → **FLASHING** + thinking chirp
-- session running → **PULSING**
-- session blocked but no permission prompt → **BREATHING** (slow)
-- otherwise → **SOLID** (idle, connected)
-
-When Buddy is **not** connected (or no heartbeat for 30s), LED falls back to BREATHING idle and the USB-serial MCP commands take over.
-
-The Function button does the right thing for the moment:
-
-- if a Buddy prompt is pending → sends `{"cmd":"permission","decision":"once"}` → buzzer plays "approved" jingle
-- otherwise → sends `Ctrl+Option+F19` → triggers Wispr Flow voice dictation
-
-The Auto-Accept switch:
-
-- when ON: any incoming Buddy prompt is auto-approved immediately, **and** the device also taps Enter every 1s as a CLI fallback (terminal Claude Code that isn't Buddy-aware).
-
-## Build
-
-Requires:
-
-- ESP32 Arduino Core **3.3.7+**
-- NimBLE-Arduino **2.3.8+**
-- HijelHID_BLEKeyboard **0.5.0+**
-- ArduinoJson **7.x**
+## Firmware (`claude_approval_device/`)
 
 ```bash
 arduino-cli core install esp32:esp32@3.3.8
-arduino-cli lib install "NimBLE-Arduino" "HijelHID_BLEKeyboard" "ArduinoJson"
+arduino-cli lib install "NimBLE-Arduino" "ArduinoJson"
 arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3 claude_approval_device
 arduino-cli upload  -p /dev/cu.usbmodem101 --fqbn esp32:esp32:XIAO_ESP32S3 claude_approval_device
 ```
 
-## Pair
+The device speaks newline-delimited JSON over BLE NUS:
 
-1. **HID side (terminal CLI)** — macOS → System Settings → Bluetooth → connect *ClaudeApprover*. Wispr Flow → trigger settings → press Function button to capture `Ctrl+Option+F19`.
-2. **Hardware Buddy side (Claude Desktop)** — Help → Troubleshooting → *Enable Developer Mode* → Developer menu → *Open Hardware Buddy…* → Connect → pick *ClaudeApprover*. The LED switches from breathing to solid once heartbeats arrive.
+| Direction          | Examples                                                               |
+|--------------------|------------------------------------------------------------------------|
+| device → host      | `{"evt":"button","id":"return","action":"tap"}`                        |
+|                    | `{"evt":"switch","id":"auto_accept","state":"on"}`                     |
+|                    | `{"cmd":"permission","id":"req_…","decision":"once"}` (Buddy mode)     |
+| host → device      | `{"cmd":"led","mode":"solid"}`                                         |
+|                    | `{"cmd":"jingle","name":"approved"}`                                   |
+|                    | `{"cmd":"tone","freq":1000,"ms":200}`                                  |
+|                    | Hardware Buddy heartbeat snapshots (running/waiting/prompt/...)        |
 
-Both can be paired at the same time.
+## Menu-bar app (`menubar-app/`)
 
-## MCP server
+Swift Package, builds a `Claude Approver.app` bundle. Owns the BLE bond,
+injects keystrokes via `CGEventPost`, and exposes a localhost HTTP API on
+`127.0.0.1:47823` for the MCP shim.
 
-See [`mcp-server/`](./mcp-server/). Plug in the device via USB-C, install with `uv sync`, wire up to Claude Code or Claude Desktop via `~/.claude.json` or the Desktop config. Tools:
+```bash
+cd menubar-app
+./scripts/build-app.sh
+cp -R "build/Claude Approver.app" /Applications/
+open "/Applications/Claude Approver.app"
+```
 
-- `set_led_status` — BREATHING / PULSING / SOLID / FLASH / OFF
-- `play_tone` — frequency + duration
-- `play_jingle` — startup / approved / denied / thinking / waiting
-- `device_status` — serial connection state
+First launch will prompt for **Bluetooth** and **Accessibility** permissions —
+allow both. Bluetooth is needed to maintain the BLE bond; Accessibility is
+needed to inject keystrokes into the focused window.
 
-The MCP server only matters when the device is plugged in. Untethered, the BLE HID and Hardware Buddy paths still work.
+To auto-start on login:
 
-## Why this layering
+```bash
+./scripts/install-launchagent.sh           # install
+./scripts/install-launchagent.sh --uninstall  # remove
+```
 
-Apple deliberately hides system-bonded BLE HID peripherals from third-party CoreBluetooth scans. That blocks the obvious "open a custom GATT characteristic on the same peripheral and write commands to it" approach. The Hardware Buddy protocol works because Claude Desktop pairs the NUS service through its own in-app CoreBluetooth flow rather than the OS HID system. We advertise both services on the same peripheral; the OS bonds the HID half, Claude Desktop bonds the NUS half independently. Best of both worlds.
+Logs go to `~/Library/Logs/ClaudeApprover.log`.
 
-The earlier T-vK `ESP32-BLE-Keyboard` library on arduino-esp32 2.x produced `BTM_GetSecurityFlags false` errors on macOS Sonoma+ and macOS silently dropped every HID notification. Switching to HijelHID_BLEKeyboard (NimBLE 2.x stack) on arduino-esp32 3.x fixed it.
+## MCP shim (`mcp-server/`)
+
+Python MCP server that forwards Claude Code tool calls to the menu-bar app via
+HTTP.
+
+```bash
+cd mcp-server
+uv sync
+```
+
+Claude Code config (`~/.claude.json` or per-project `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "approval-device": {
+      "command": "uv",
+      "args": [
+        "--directory", "/absolute/path/to/repo/mcp-server",
+        "run", "server.py"
+      ]
+    }
+  }
+}
+```
+
+Same shape works in `~/Library/Application Support/Claude/claude_desktop_config.json`
+for Claude Desktop.
+
+Tools:
+
+| Tool             | Args                                                | Effect                              |
+|------------------|-----------------------------------------------------|-------------------------------------|
+| `set_led_status` | `status` (BREATHING/PULSING/SOLID/FLASH/OFF)        | LED animation mode                  |
+| `play_tone`      | `frequency_hz`, `duration_ms`                       | One-shot buzzer tone                |
+| `play_jingle`    | `name` (startup/approved/denied/thinking/waiting)   | Preset jingle                       |
+| `device_status`  | —                                                   | BLE connection state from menu-bar app |
+
+## How it ended up here
+
+First iteration tried to make the device a normal BLE keyboard *and* expose a
+custom GATT control channel. macOS hides system-bonded HID peripherals from
+every third-party app, so the control channel had no way to reach the device.
+Anthropic's [`claude-desktop-buddy`](https://github.com/anthropics/claude-desktop-buddy)
+solves the same problem by *not* being HID — the device is a generic BLE
+peripheral, the host app injects keystrokes via the macOS event system. We
+adopted the same architecture.
