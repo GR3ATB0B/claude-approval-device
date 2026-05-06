@@ -1,33 +1,44 @@
 /*
- * Claude Code Approval Device
+ * Claude Code Approval Device — dual-mode firmware
  * Hardware: Seeed Studio XIAO ESP32-S3
  *
- * BLE HID keyboard (paired with macOS/iOS/Android/Windows/Linux as
- * "ClaudeApprover"). Three physical inputs:
+ * Two BLE roles served from one peripheral:
  *
- *   D0 - Function button -> sends Ctrl+Option+F19  (Wispr Flow trigger)
- *   D1 - Return button   -> sends Enter
- *   D2 - Auto-accept switch (latching) -> spams Enter every 1s while ON
+ * 1. BLE HID keyboard ("ClaudeApprover") — for Claude Code CLI in a terminal,
+ *    or any app that listens for keyboard input. Buttons send key combos.
+ * 2. Anthropic Hardware Buddy NUS service — for Claude Desktop / Claude
+ *    Cowork via Developer → Open Hardware Buddy. Receives heartbeats with
+ *    permission prompts; sends structured permission decisions back.
  *
- * Plus visual + audio status (controllable from Mac via USB serial):
+ * Same firmware speaks both. Mac may system-pair the HID; Claude Desktop
+ * connects to the NUS service via CoreBluetooth.
  *
- *   D5 - Passive buzzer (jingles + tones)
- *   D8 - Blue LED (PWM, inverted: LOW = on, breathing/pulsing/solid/flash)
+ * Buttons:
+ *   D0 - Function     -> Hardware Buddy "once" approval if a prompt is
+ *                        pending; otherwise sends Ctrl+Option+F19 (Wispr Flow)
+ *   D1 - Return       -> sends Enter via HID
+ *   D2 - Auto-accept  -> while ON, auto-approves any incoming prompt and
+ *                        also keeps spamming Enter every 1s as a CLI fallback
  *
- * USB serial control channel (115200 baud). Mac's MCP server pushes commands:
+ * Status:
+ *   D5 - passive buzzer (jingles + tones)
+ *   D8 - blue LED (PWM, inverted: LOW = on)
  *
- *   STATUS:BREATHING|PULSING|SOLID|FLASH|OFF
- *   TONE:<freq_hz>,<duration_ms>
- *   JINGLE:startup|approved|denied|thinking|waiting
+ *   LED is driven by Hardware Buddy heartbeats when connected:
+ *     prompt waiting   -> FLASH + thinking jingle once
+ *     running > 0      -> PULSING
+ *     waiting > 0      -> BREATHING (slow)
+ *     otherwise        -> SOLID (idle, connected)
+ *   When no Buddy connection, USB serial commands win (STATUS:/JINGLE:/TONE:).
  *
- * Build:
- *   ESP32 Arduino Core 3.3.7+
- *   NimBLE-Arduino 2.3.8+
- *   HijelHID_BLEKeyboard 0.5.0+
- *   FQBN: esp32:esp32:XIAO_ESP32S3
+ * Requires:
+ *   esp32 core 3.3.7+, NimBLE-Arduino 2.3.8+, HijelHID_BLEKeyboard 0.5.0+,
+ *   ArduinoJson 7.x
  */
 
 #include <HijelHID_BLEKeyboard.h>
+#include <NimBLEDevice.h>
+#include <ArduinoJson.h>
 
 HijelHID_BLEKeyboard keyboard("ClaudeApprover", "Banana");
 
@@ -37,6 +48,30 @@ HijelHID_BLEKeyboard keyboard("ClaudeApprover", "Banana");
 #define PIN_BUZZER      D5
 #define PIN_LED         D8
 
+// ── Hardware Buddy BLE NUS protocol (matches Anthropic spec) ─────────────────
+#define NUS_SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define NUS_RX_UUID      "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  // host -> device
+#define NUS_TX_UUID      "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  // device -> host
+
+NimBLECharacteristic* nusRxChar = nullptr;
+NimBLECharacteristic* nusTxChar = nullptr;
+String nusRxBuffer;
+
+// Buddy state
+String pendingPromptId;
+String pendingPromptTool;
+String pendingPromptHint;
+unsigned long lastHeartbeatMs = 0;
+int hbRunning = 0, hbWaiting = 0, hbTotal = 0;
+String deviceName = "Clawd";
+String ownerName  = "";
+uint32_t apprCount = 0, denyCount = 0;
+unsigned long bootMs = 0;
+
+void processCommand(String cmd);  // forward decl (USB serial)
+void sendBuddy(const String& json);
+
+// LED status
 enum LEDStatus { LED_OFF, LED_BREATHING, LED_PULSING, LED_SOLID, LED_FLASHING };
 LEDStatus currentLEDStatus = LED_BREATHING;
 
@@ -56,12 +91,156 @@ const unsigned long debounceDelay = 50;
 unsigned long lastAutoSpam = 0;
 const unsigned long autoSpamInterval = 1000;
 
-String commandBuffer = "";
+String commandBuffer = "";  // USB serial line buffer
+
+// ── Buddy command handlers ────────────────────────────────────────────────────
+
+void handleBuddyCmd(JsonDocument& doc) {
+  const char* cmd = doc["cmd"];
+  if (!cmd) return;
+  String c = cmd;
+
+  if (c == "status") {
+    JsonDocument resp;
+    resp["ack"] = "status";
+    resp["ok"] = true;
+    JsonObject d = resp["data"].to<JsonObject>();
+    d["name"] = deviceName;
+    d["sec"] = false;  // we don't bond Buddy link with encryption (yet)
+    JsonObject sys = d["sys"].to<JsonObject>();
+    sys["up"] = (millis() - bootMs) / 1000;
+    sys["heap"] = ESP.getFreeHeap();
+    JsonObject stats = d["stats"].to<JsonObject>();
+    stats["appr"] = apprCount;
+    stats["deny"] = denyCount;
+    String out;
+    serializeJson(resp, out);
+    sendBuddy(out);
+
+  } else if (c == "name") {
+    if (doc["name"].is<const char*>()) {
+      deviceName = String((const char*)doc["name"]);
+    }
+    sendBuddy("{\"ack\":\"name\",\"ok\":true}");
+
+  } else if (c == "owner") {
+    if (doc["name"].is<const char*>()) {
+      ownerName = String((const char*)doc["name"]);
+      Serial.printf("[BUDDY] owner is %s\n", ownerName.c_str());
+    }
+    sendBuddy("{\"ack\":\"owner\",\"ok\":true}");
+
+  } else if (c == "unpair") {
+    NimBLEDevice::deleteAllBonds();
+    sendBuddy("{\"ack\":\"unpair\",\"ok\":true}");
+  }
+  // chunk/file/char_begin/char_end ignored — no folder push support yet
+}
+
+void handleBuddyHeartbeat(JsonDocument& doc) {
+  lastHeartbeatMs = millis();
+  hbTotal   = doc["total"]   | 0;
+  hbRunning = doc["running"] | 0;
+  hbWaiting = doc["waiting"] | 0;
+
+  if (doc["msg"].is<const char*>()) {
+    Serial.printf("[BUDDY HB] %s (run=%d wait=%d)\n",
+                  (const char*)doc["msg"], hbRunning, hbWaiting);
+  }
+
+  if (doc["prompt"].is<JsonObject>()) {
+    JsonObject p = doc["prompt"];
+    String newId = p["id"] | "";
+    if (newId.length() > 0 && newId != pendingPromptId) {
+      pendingPromptId   = newId;
+      pendingPromptTool = String((const char*)(p["tool"] | ""));
+      pendingPromptHint = String((const char*)(p["hint"] | ""));
+      Serial.printf("[BUDDY] prompt %s tool=%s\n",
+                    pendingPromptId.c_str(), pendingPromptTool.c_str());
+      currentLEDStatus = LED_FLASHING;
+      playJingle("thinking");
+
+      // Auto-accept switch ON: immediately approve.
+      if (digitalRead(PIN_AUTO_SWITCH) == LOW) {
+        respondPermission("once");
+      }
+    }
+  } else {
+    // No active prompt — pick LED mode from session counts.
+    pendingPromptId = "";
+    if (hbWaiting > 0)      currentLEDStatus = LED_BREATHING;
+    else if (hbRunning > 0) currentLEDStatus = LED_PULSING;
+    else                    currentLEDStatus = LED_SOLID;
+  }
+}
+
+void respondPermission(const char* decision) {
+  if (pendingPromptId.length() == 0) return;
+  JsonDocument out;
+  out["cmd"] = "permission";
+  out["id"] = pendingPromptId;
+  out["decision"] = decision;
+  String s;
+  serializeJson(out, s);
+  sendBuddy(s);
+  if (String(decision) == "once") {
+    apprCount++;
+    playJingle("approved");
+  } else {
+    denyCount++;
+    playJingle("denied");
+  }
+  pendingPromptId = "";
+  currentLEDStatus = LED_PULSING;
+}
+
+void processBuddyLine(const String& line) {
+  if (line.length() == 0) return;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, line);
+  if (err) {
+    Serial.printf("[BUDDY] JSON parse error: %s\n", err.c_str());
+    return;
+  }
+  if (doc["cmd"].is<const char*>()) {
+    handleBuddyCmd(doc);
+  } else {
+    handleBuddyHeartbeat(doc);
+  }
+}
+
+class NusRxCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& info) override {
+    std::string val = chr->getValue();
+    nusRxBuffer.concat(val.c_str());
+    int nl;
+    while ((nl = nusRxBuffer.indexOf('\n')) >= 0) {
+      String line = nusRxBuffer.substring(0, nl);
+      nusRxBuffer.remove(0, nl + 1);
+      processBuddyLine(line);
+    }
+  }
+};
+
+NusRxCallbacks nusCallbacks;
+
+void sendBuddy(const String& json) {
+  if (!nusTxChar) return;
+  String line = json + "\n";
+  // BLE notification MTU is small; NimBLE auto-fragments under setValue+notify.
+  nusTxChar->setValue((uint8_t*)line.c_str(), line.length());
+  nusTxChar->notify();
+  Serial.print("[BUDDY TX] ");
+  Serial.println(json);
+}
+
+// ── Setup ─────────────────────────────────────────────────────────────────────
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n[ClaudeApprover] boot");
+  Serial.println("\n[ClaudeApprover] dual-mode boot");
+  bootMs = millis();
 
   pinMode(PIN_FUNC_BTN, INPUT_PULLUP);
   pinMode(PIN_RETURN_BTN, INPUT_PULLUP);
@@ -72,11 +251,30 @@ void setup() {
 
   keyboard.setLogLevel(HIDLogLevel::Normal);
   keyboard.begin();
-  Serial.println("[ClaudeApprover] BLE advertising as 'ClaudeApprover'");
+  Serial.println("[BLE HID] advertising as 'ClaudeApprover'");
+
+  // Add Hardware Buddy NUS service to the same peripheral.
+  NimBLEServer* server = NimBLEDevice::createServer();  // singleton — returns existing
+  NimBLEService* nus = server->createService(NUS_SERVICE_UUID);
+  nusRxChar = nus->createCharacteristic(
+      NUS_RX_UUID,
+      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  nusRxChar->setCallbacks(&nusCallbacks);
+  nusTxChar = nus->createCharacteristic(
+      NUS_TX_UUID,
+      NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
+  nus->start();
+  // HijelHID owns the advertising data; we add our service UUID to it.
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(NUS_SERVICE_UUID);
+  adv->start();
+  Serial.println("[BLE NUS] Hardware Buddy service ready");
 
   playJingle("startup");
   currentLEDStatus = LED_BREATHING;
 }
+
+// ── Loop ──────────────────────────────────────────────────────────────────────
 
 void loop() {
   handleSerialCommands();
@@ -88,11 +286,11 @@ void loop() {
   if (switchState != lastSwitchState) {
     if (switchState == LOW) {
       Serial.println("AUTO-ACCEPT: ON");
-      currentLEDStatus = LED_SOLID;
       playTone(1000, 100);
+      // If a prompt is already pending, approve it now.
+      if (pendingPromptId.length() > 0) respondPermission("once");
     } else {
       Serial.println("AUTO-ACCEPT: OFF");
-      currentLEDStatus = LED_BREATHING;
       playTone(800, 50);
       delay(100);
       playTone(800, 50);
@@ -100,6 +298,7 @@ void loop() {
     lastSwitchState = switchState;
   }
 
+  // CLI fallback: while switch ON, also spam Enter via HID for terminal Claude Code.
   if (switchState == LOW && keyboard.isPaired()) {
     if (millis() - lastAutoSpam >= autoSpamInterval) {
       keyboard.tap(KEY_RETURN);
@@ -110,31 +309,32 @@ void loop() {
     }
   }
 
-  // Function button -> Ctrl+Option+F19 (3-key combo, fits Wispr Flow's limit)
+  // Function button: prefer Buddy approval when a prompt is live, else Wispr.
   if (funcState == LOW && lastFuncState == HIGH &&
       (millis() - lastFuncPress > debounceDelay)) {
     lastFuncPress = millis();
-    Serial.println("FUNCTION pressed");
-    if (keyboard.isPaired()) {
-      keyboard.press(KEY_F19, KEY_MOD_LCTRL | KEY_MOD_LALT);
+    if (pendingPromptId.length() > 0) {
+      Serial.println("FUNCTION pressed -> Buddy approve(once)");
+      respondPermission("once");
+    } else {
+      Serial.println("FUNCTION pressed -> Ctrl+Option+F19 (Wispr Flow)");
+      if (keyboard.isPaired()) {
+        keyboard.press(KEY_F19, KEY_MOD_LCTRL | KEY_MOD_LALT);
+      }
+      playTone(1200, 50);
     }
-    playTone(1200, 50);
   } else if (funcState == HIGH && lastFuncState == LOW) {
-    Serial.println("FUNCTION released");
-    if (keyboard.isPaired()) {
-      keyboard.releaseAll();
-    }
+    if (keyboard.isPaired()) keyboard.releaseAll();
     playTone(1000, 50);
   }
   lastFuncState = funcState;
 
+  // Return button: Enter via HID (works for terminal CLI Claude Code).
   if (returnState == LOW && lastReturnState == HIGH &&
       (millis() - lastReturnPress > debounceDelay)) {
     lastReturnPress = millis();
-    Serial.println("RETURN pressed");
-    if (keyboard.isPaired()) {
-      keyboard.tap(KEY_RETURN);
-    }
+    Serial.println("RETURN pressed -> Enter");
+    if (keyboard.isPaired()) keyboard.tap(KEY_RETURN);
     playTone(1500, 80);
     digitalWrite(PIN_LED, LOW);
     delay(20);
@@ -142,9 +342,19 @@ void loop() {
   }
   lastReturnState = returnState;
 
+  // Heartbeat watchdog: if Buddy stops sending for >30s, fall back to breathing idle.
+  if (lastHeartbeatMs > 0 && millis() - lastHeartbeatMs > 30000) {
+    if (currentLEDStatus != LED_BREATHING && currentLEDStatus != LED_OFF) {
+      Serial.println("[BUDDY] heartbeat stale, idle");
+      currentLEDStatus = LED_BREATHING;
+    }
+  }
+
   updateLED();
   delay(10);
 }
+
+// ── USB serial control channel (independent of Buddy) ────────────────────────
 
 void handleSerialCommands() {
   while (Serial.available() > 0) {
@@ -187,6 +397,8 @@ void processCommand(String cmd) {
     playJingle(jingle);
   }
 }
+
+// ── LED ──────────────────────────────────────────────────────────────────────
 
 void updateLED() {
   unsigned long now = millis();

@@ -1,89 +1,82 @@
 # Claude Code Approval Device
 
-A small wireless BLE keyboard for approving Claude Code prompts and triggering
-voice dictation. Built on a Seeed Studio XIAO ESP32-S3.
+A small wireless dongle for approving Claude Code prompts and triggering voice
+dictation. Built on a Seeed Studio XIAO ESP32-S3.
 
-The device pairs with your Mac as a normal Bluetooth keyboard. Three physical
-controls do specific things:
+The device runs **three** transports out of one firmware:
 
-| Control                | Sends                       | Use it for                      |
-|------------------------|-----------------------------|---------------------------------|
-| **Function** button    | `Ctrl+Option+F19`           | Wispr Flow voice dictation hotkey |
-| **Return** button      | `Enter`                     | Approving Claude Code prompts   |
-| **Auto-Accept** switch | spams `Enter` every 1s      | Hands-free YOLO approval mode   |
+| Surface                | What it does                                                                                  |
+|------------------------|-----------------------------------------------------------------------------------------------|
+| **BLE HID keyboard**   | Pairs as `ClaudeApprover`. Return button = Enter, Auto-Accept switch = Enter spam, Function button = `Ctrl+Option+F19` (Wispr Flow). Works for terminal Claude Code, any text field. |
+| **Hardware Buddy NUS** | Same BLE peripheral also implements Anthropic's [Claude Desktop Buddy](https://github.com/anthropics/claude-desktop-buddy) wire protocol. When connected via Claude Desktop's Developer → Open Hardware Buddy panel, heartbeats drive the LED and Function button sends a structured `permission:once` decision keyed to the active prompt. No keyboard-focus race. |
+| **USB serial MCP**     | Plug in the cable, run the bundled MCP server, and Claude can drive LED status + buzzer jingles directly. |
 
-When you also have it plugged in via USB-C, an MCP server (in `mcp-server/`)
-exposes tools so Claude can drive the LED and buzzer for status feedback —
-e.g. play an "approved" jingle, set the LED to solid red, etc.
+## Inputs / outputs
 
-## Hardware
+| Pin (silkscreen) | Component             | Notes                                                |
+|------------------|-----------------------|------------------------------------------------------|
+| D0               | Function button       | Buddy approve when prompt active, else `Ctrl+Opt+F19` |
+| D1               | Return button         | sends Enter via HID                                  |
+| D2               | Auto-accept switch    | spams Enter via HID + auto-approves Buddy prompts    |
+| D5               | Passive piezo buzzer  | middle pin → 3.3V, − → GND, S → D5                   |
+| D8               | Blue LED (PWM)        | anode → 3.3V, cathode → D8 (inverted, LOW = on)      |
 
-- Seeed Studio XIAO ESP32-S3
-- Two momentary push buttons (Function, Return)
-- One latching SPST switch (Auto-Accept)
-- One passive piezo buzzer
-- One blue LED
+## Behaviour summary
 
-### Wiring (silkscreen labels on the XIAO)
+When **Hardware Buddy is connected**, the LED reflects what Claude Desktop is doing:
 
-| Component          | Pin  | Notes                                   |
-|--------------------|------|-----------------------------------------|
-| Function button    | D0   | other side to GND, internal pull-up     |
-| Return button      | D1   | other side to GND, internal pull-up     |
-| Auto-Accept switch | D2   | other side to GND, internal pull-up     |
-| Buzzer S pin       | D5   | middle pin → 3.3V, − pin → GND          |
-| LED cathode        | D8   | LED anode → 3.3V (inverted PWM)         |
+- prompt waiting → **FLASHING** + thinking chirp
+- session running → **PULSING**
+- session blocked but no permission prompt → **BREATHING** (slow)
+- otherwise → **SOLID** (idle, connected)
 
-## Firmware (`claude_approval_device.ino`)
+When Buddy is **not** connected (or no heartbeat for 30s), LED falls back to BREATHING idle and the USB-serial MCP commands take over.
+
+The Function button does the right thing for the moment:
+
+- if a Buddy prompt is pending → sends `{"cmd":"permission","decision":"once"}` → buzzer plays "approved" jingle
+- otherwise → sends `Ctrl+Option+F19` → triggers Wispr Flow voice dictation
+
+The Auto-Accept switch:
+
+- when ON: any incoming Buddy prompt is auto-approved immediately, **and** the device also taps Enter every 1s as a CLI fallback (terminal Claude Code that isn't Buddy-aware).
+
+## Build
 
 Requires:
 
 - ESP32 Arduino Core **3.3.7+**
 - NimBLE-Arduino **2.3.8+**
 - HijelHID_BLEKeyboard **0.5.0+**
+- ArduinoJson **7.x**
 
 ```bash
 arduino-cli core install esp32:esp32@3.3.8
-arduino-cli lib install "NimBLE-Arduino"
-arduino-cli lib install "HijelHID_BLEKeyboard"
+arduino-cli lib install "NimBLE-Arduino" "HijelHID_BLEKeyboard" "ArduinoJson"
 arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3 .
 arduino-cli upload  -p /dev/cu.usbmodem101 --fqbn esp32:esp32:XIAO_ESP32S3 .
 ```
 
-### Pair
+## Pair
 
-1. macOS → System Settings → Bluetooth
-2. Power up the device. Look for **ClaudeApprover** in *Nearby Devices*.
-3. Click *Connect* / *Pair*.
-4. In Wispr Flow → trigger settings, focus the shortcut field, press the
-   Function button on the device once. Wispr captures `Ctrl+Option+F19`.
-5. Press Return button → sends `Enter` to whichever app is focused.
-6. Flick Auto-Accept ON → device sends `Enter` every 1 second until OFF.
+1. **HID side (terminal CLI)** — macOS → System Settings → Bluetooth → connect *ClaudeApprover*. Wispr Flow → trigger settings → press Function button to capture `Ctrl+Option+F19`.
+2. **Hardware Buddy side (Claude Desktop)** — Help → Troubleshooting → *Enable Developer Mode* → Developer menu → *Open Hardware Buddy…* → Connect → pick *ClaudeApprover*. The LED switches from breathing to solid once heartbeats arrive.
 
-## Control channel (`mcp-server/`)
+Both can be paired at the same time.
 
-Plug the device into your Mac via USB-C while the MCP server is running.
-Claude (Code or Desktop) gets four tools:
+## MCP server
 
-| Tool             | Effect                                              |
-|------------------|-----------------------------------------------------|
-| `set_led_status` | LED mode: BREATHING / PULSING / SOLID / FLASH / OFF |
-| `play_tone`      | one-shot buzzer tone (Hz, ms)                       |
-| `play_jingle`    | startup / approved / denied / thinking / waiting    |
-| `device_status`  | reports the serial connection state                 |
+See [`mcp-server/`](./mcp-server/). Plug in the device via USB-C, install with `uv sync`, wire up to Claude Code or Claude Desktop via `~/.claude.json` or the Desktop config. Tools:
 
-See `mcp-server/README.md` for installation and Claude config.
+- `set_led_status` — BREATHING / PULSING / SOLID / FLASH / OFF
+- `play_tone` — frequency + duration
+- `play_jingle` — startup / approved / denied / thinking / waiting
+- `device_status` — serial connection state
 
-The keyboard side works **wirelessly via BLE**. The LED/buzzer control channel
-runs over **USB serial** because macOS (by Apple's design) does not let
-third-party apps write GATT data to a system-bonded BLE HID device. Plug the
-device in when sitting at your desk; unplug for wireless use as a keyboard.
+The MCP server only matters when the device is plugged in. Untethered, the BLE HID and Hardware Buddy paths still work.
 
-## Notes on the BLE library choice
+## Why this layering
 
-The first iteration used the original T-vK `ESP32-BLE-Keyboard` library on
-arduino-esp32 2.x. It pairs with macOS Sonoma+ but the Bluedroid stack throws
-`BTM_GetSecurityFlags false` errors and macOS silently drops every HID
-notification. Switching to **HijelHID_BLEKeyboard** (NimBLE 2.x stack) on
-arduino-esp32 3.x fixes this completely. Worth knowing if you build something
-similar.
+Apple deliberately hides system-bonded BLE HID peripherals from third-party CoreBluetooth scans. That blocks the obvious "open a custom GATT characteristic on the same peripheral and write commands to it" approach. The Hardware Buddy protocol works because Claude Desktop pairs the NUS service through its own in-app CoreBluetooth flow rather than the OS HID system. We advertise both services on the same peripheral; the OS bonds the HID half, Claude Desktop bonds the NUS half independently. Best of both worlds.
+
+The earlier T-vK `ESP32-BLE-Keyboard` library on arduino-esp32 2.x produced `BTM_GetSecurityFlags false` errors on macOS Sonoma+ and macOS silently dropped every HID notification. Switching to HijelHID_BLEKeyboard (NimBLE 2.x stack) on arduino-esp32 3.x fixed it.
