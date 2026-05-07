@@ -37,6 +37,7 @@ final class Bridge: ObservableObject {
 
     @Published var hasAccessibility: Bool = false
     @Published var httpRunning: Bool = false
+    @Published var autoAcceptOn: Bool = false  // software toggle, bypasses broken D2 switch
 
     init() {
         hasAccessibility = EventInjector.ensureAccessibility(prompt: false)
@@ -75,6 +76,15 @@ final class Bridge: ObservableObject {
         case ("POST", "/jingle"):
             ble.send(["cmd": "jingle", "name": json["name"] as? String ?? "startup"])
             return (200, jsonData(["ok": true]))
+        case ("POST", "/thinking/start"):
+            // Claude Code hook: user just submitted a prompt → spinner is on.
+            ble.send(["cmd": "led", "mode": "pulsing"])
+            return (200, jsonData(["ok": true]))
+        case ("POST", "/thinking/stop"):
+            // Claude Code hook: assistant finished → spinner gone, beep + solid.
+            ble.send(["cmd": "led", "mode": "solid"])
+            ble.send(["cmd": "jingle", "name": "done"])
+            return (200, jsonData(["ok": true]))
         case ("POST", "/tone"):
             let freq = json["freq"] as? Int ?? 1000
             let ms = json["ms"] as? Int ?? 100
@@ -100,6 +110,16 @@ final class Bridge: ObservableObject {
 
     func requestAccessibility() {
         hasAccessibility = EventInjector.ensureAccessibility(prompt: true)
+    }
+
+    /// Software auto-accept toggle. The physical D2 switch is unreliable
+    /// (stuck LOW), so this bypasses BLE switch events entirely and drives
+    /// the Return-spam timer directly from the menu UI.
+    func toggleAutoAccept() {
+        autoAcceptOn.toggle()
+        if autoAcceptOn { injector.startAutoAccept() }
+        else            { injector.stopAutoAccept() }
+        NSLog("[Bridge] software auto-accept = \(autoAcceptOn)")
     }
 
     /// Releases every key we might have held down, stops the auto-accept
@@ -147,9 +167,9 @@ final class Bridge: ObservableObject {
     }
 
     private func handleSwitch(id: String, state: String) {
-        guard id == "auto_accept" else { return }
-        if state == "on" { injector.startAutoAccept() }
-        else             { injector.stopAutoAccept() }
+        // D2 hardware is unreliable — switch events from the device are
+        // logged but ignored. Auto-accept is now driven from the menu UI.
+        NSLog("[Bridge] BLE switch event ignored: \(id)=\(state) (D2 stuck — use menu toggle)")
     }
 }
 
@@ -166,8 +186,27 @@ struct MenuView: View {
                 Text(statusText).bold()
             }
 
+            // Big AUTO-ACCEPT toggle — software replacement for the broken D2 switch.
+            Button(action: { bridge.toggleAutoAccept() }) {
+                HStack {
+                    Image(systemName: bridge.autoAcceptOn
+                          ? "checkmark.circle.fill"
+                          : "circle")
+                    Text(bridge.autoAcceptOn ? "AUTO-ACCEPT: ON" : "AUTO-ACCEPT: OFF").bold()
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 6)
+                .background((bridge.autoAcceptOn ? Color.green : Color.gray).opacity(0.22))
+                .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+            .help("Spams the Return key every second while ON. Click to toggle.")
+
             // Big red EMERGENCY STOP — released stuck keys + stops auto-accept.
-            Button(action: { bridge.emergencyStop() }) {
+            Button(action: {
+                bridge.emergencyStop()
+                bridge.autoAcceptOn = false
+            }) {
                 HStack {
                     Image(systemName: "stop.circle.fill")
                     Text("Emergency Stop").bold()

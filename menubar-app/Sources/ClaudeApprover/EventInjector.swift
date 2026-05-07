@@ -108,8 +108,11 @@ final class EventInjector {
             NSLog("[Injector] CGEvent allocation failed")
             return
         }
-        if !flags.isEmpty { event.flags = flags }
+        // Always assign flags. Leaving them unset lets CGEvent inherit the
+        // current system modifier state, so a Return tap right after the
+        // Wispr combo released could arrive as Ctrl+Opt+Return.
+        event.flags = flags
         event.post(tap: .cghidEventTap)
-        NSLog("[Injector] posted key=0x\(String(key, radix: 16)) down=\(down)")
+        NSLog("[Injector] posted key=0x\(String(key, radix: 16)) down=\(down) flags=\(flags.rawValue)")
     }
 }

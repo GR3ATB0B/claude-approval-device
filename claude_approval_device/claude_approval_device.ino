@@ -30,6 +30,8 @@
 
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
 
 // ── Pin map (XIAO ESP32-S3 silkscreen) ───────────────────────────────────────
 
@@ -57,7 +59,7 @@ volatile bool centralConnected = false;
 // ── LED state ────────────────────────────────────────────────────────────────
 
 enum LEDStatus { LED_OFF, LED_BREATHING, LED_PULSING, LED_SOLID, LED_FLASHING };
-LEDStatus currentLEDStatus = LED_BREATHING;
+LEDStatus currentLEDStatus = LED_FLASHING;  // boot state = "no host yet"
 
 unsigned long lastLEDUpdate = 0;
 int ledBrightness = 0;
@@ -69,9 +71,29 @@ bool ledState = false;
 bool lastFuncState = HIGH;
 bool lastReturnState = HIGH;
 bool lastSwitchState = HIGH;
+bool lastSwitchReading = HIGH;
 unsigned long lastFuncPress = 0;
 unsigned long lastReturnPress = 0;
+unsigned long lastSwitchChangeMs = 0;
 const unsigned long debounceDelay = 50;
+// Switch debounce — short, so a real flip commits even with a marginal
+// contact. Tradeoff: physical wiggle may chatter. Hardware fix (reflow
+// joints / replace switch) is the real cure if chatter is bad.
+const unsigned long switchDebounceDelay = 50;
+
+// Return long-press → enter deep sleep (firmware-level power off).
+unsigned long returnPressStartMs = 0;
+bool returnLongPressFired = false;
+const unsigned long RETURN_LONG_PRESS_MS = 2000;
+
+// Auto-sleep: device drops to deep sleep after this much inactivity.
+// Any button or the auto-accept switch (EXT1 wake on D0/D1/D2 LOW) brings it back.
+unsigned long lastActivityMs = 0;
+const unsigned long IDLE_SLEEP_TIMEOUT_MS = 5UL * 60UL * 1000UL;  // 5 min
+
+// Set after EXT1 wake-from-sleep so the still-pressed wake button
+// doesn't immediately get interpreted as a fresh button event.
+bool ignoreButtonsUntilRelease = false;
 
 // ── Hardware Buddy state (when Anthropic's panel or our middleman is connected) ──
 
@@ -87,11 +109,30 @@ unsigned long bootMs = 0;
 unsigned long lastBatteryEmit = 0;
 const unsigned long batteryEmitInterval = 30000;  // 30 s
 
+// Plain XIAO ESP32-S3 (non-Sense) has no internal divider from BAT+ to D9.
+// Without an external 100k+100k divider wired by the user, D9 floats and
+// reading is meaningless. Detect that case and report "unsupported".
+bool batterySensingAvailable() {
+  // Sample the pin a few times. If it hovers near 0 OR pinned to rail
+  // with no plausible variation, assume nothing is wired to it.
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogRead(PIN_BATTERY);
+  int raw = sum / 8;
+  // Battery via 2:1 divider on a 3.0–4.2 V cell maps to ~1860–2600 mV at the
+  // ADC pin → raw ~2300–3200. Anything outside [200, 3900] = no real signal.
+  return raw > 200 && raw < 3900;
+}
+
 float readBatteryVoltage() {
-  // ESP32 ADC is 12-bit (0..4095) referenced to ~3.3V. Divider is 2:1.
-  int raw = analogRead(PIN_BATTERY);
-  float v_pin = (raw / 4095.0f) * 3.3f;
-  return v_pin * 2.0f;  // back-out divider
+  uint32_t mv_pin = analogReadMilliVolts(PIN_BATTERY);
+  static uint32_t lastLog = 0;
+  if (millis() - lastLog > 5000) {
+    lastLog = millis();
+    int raw = analogRead(PIN_BATTERY);
+    Serial.printf("[BAT] raw=%d mv_pin=%u mv_bat=%u\n",
+                  raw, (unsigned)mv_pin, (unsigned)(mv_pin * 2));
+  }
+  return (mv_pin * 2.0f) / 1000.0f;
 }
 
 int readBatteryPercent() {
@@ -132,12 +173,17 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server, NimBLEConnInfo& info) override {
     centralConnected = true;
     Serial.println("[BLE] central connected");
-    // Send hello so the middleman knows who we are
+    // Connected + nothing pending = SOLID (calm "I'm here, ready").
+    currentLEDStatus = LED_SOLID;
     emitHello();
+    emitCurrentSwitchState();
   }
   void onDisconnect(NimBLEServer* server, NimBLEConnInfo& info, int reason) override {
     centralConnected = false;
     Serial.printf("[BLE] central disconnected (reason=%d)\n", reason);
+    // Disconnected = FLASHING (visible "looking for host").
+    currentLEDStatus = LED_FLASHING;
+    lastActivityMs = millis();
     NimBLEDevice::startAdvertising();
   }
 };
@@ -160,16 +206,27 @@ void emitHello() {
   JsonDocument d;
   d["evt"] = "hello";
   d["name"] = "ClaudeApprover";
-  d["fw"] = "1.0";
+  d["fw"] = "1.1";
   String s; serializeJson(d, s);
   sendBuddy(s);
+}
+
+// Send the current auto-accept switch state. Called after BLE connect so the
+// middleman's timer never desyncs from physical reality (e.g. device booted
+// with switch already ON, or middleman restarted while device stayed on).
+void emitCurrentSwitchState() {
+  emitSwitchEvent("auto_accept", lastSwitchState == LOW ? "on" : "off");
 }
 
 void emitBatteryEvent() {
   JsonDocument d;
   d["evt"] = "battery";
-  d["pct"] = readBatteryPercent();
-  d["mV"] = (int)(readBatteryVoltage() * 1000.0f);
+  if (batterySensingAvailable()) {
+    d["pct"] = readBatteryPercent();
+    d["mV"] = (int)(readBatteryVoltage() * 1000.0f);
+  } else {
+    d["available"] = false;  // no divider wired; app should hide the widget
+  }
   String s; serializeJson(d, s);
   sendBuddy(s);
 }
@@ -192,7 +249,10 @@ void emitSwitchEvent(const char* id, const char* state) {
   sendBuddy(s);
 }
 
-void respondPermission(const char* decision) {
+// Approvals/denials are silent. Beeps fire only on power-on, power-off,
+// and "Claude is fully done, waiting for you" — that's the policy.
+void respondPermission(const char* decision, bool audible = true) {
+  (void)audible;
   if (pendingPromptId.length() == 0) return;
   JsonDocument d;
   d["cmd"] = "permission";
@@ -200,10 +260,10 @@ void respondPermission(const char* decision) {
   d["decision"] = decision;
   String s; serializeJson(d, s);
   sendBuddy(s);
-  if (String(decision) == "once") { apprCount++; playJingle("approved"); }
-  else                            { denyCount++; playJingle("denied"); }
+  if (String(decision) == "once") apprCount++;
+  else                            denyCount++;
   pendingPromptId = "";
-  currentLEDStatus = LED_PULSING;
+  currentLEDStatus = LED_PULSING;  // host is acting on the approval
 }
 
 // ── Inbound JSON router ──────────────────────────────────────────────────────
@@ -229,6 +289,8 @@ void handleStatusCmd(JsonDocument& doc) {
 
 void handleHeartbeat(JsonDocument& doc) {
   lastHeartbeatMs = millis();
+  lastActivityMs  = lastHeartbeatMs;
+  int prevRunning = hbRunning;
   hbRunning = doc["running"] | 0;
   hbWaiting = doc["waiting"] | 0;
   if (doc["msg"].is<const char*>()) {
@@ -244,14 +306,22 @@ void handleHeartbeat(JsonDocument& doc) {
                     pendingPromptId.c_str(),
                     (const char*)(p["tool"] | ""));
       currentLEDStatus = LED_FLASHING;
-      playJingle("thinking");
-      if (digitalRead(PIN_AUTO_SWITCH) == LOW) respondPermission("once");
+      if (digitalRead(PIN_AUTO_SWITCH) == LOW) respondPermission("once", false);
     }
   } else {
     pendingPromptId = "";
-    if      (hbWaiting > 0) currentLEDStatus = LED_BREATHING;
-    else if (hbRunning > 0) currentLEDStatus = LED_PULSING;
-    else                    currentLEDStatus = LED_SOLID;
+    // LED policy:
+    //   Claude working (running > 0)        -> PULSING (visible activity)
+    //   Idle / done / waiting for the user  -> SOLID   (calm, attention-ready)
+    //   Pending permission prompt           -> FLASHING (handled above)
+    if (hbRunning > 0) currentLEDStatus = LED_PULSING;
+    else               currentLEDStatus = LED_SOLID;
+
+    // "Done completely" attention beep: running just dropped from >0 to 0.
+    // That's the moment Claude finished its turn and is waiting for you.
+    if (prevRunning > 0 && hbRunning == 0) {
+      playJingle("done");
+    }
   }
 }
 
@@ -308,6 +378,55 @@ void processLine(const String& raw) {
   }
 }
 
+// ── Deep sleep / power ───────────────────────────────────────────────────────
+
+// Enter ESP32-S3 deep sleep. Wake when any of D0/D1/D2 is pulled LOW
+// (button press or switch flip). Internal RTC pull-ups stay enabled
+// through sleep so the buttons read HIGH at rest.
+void enterDeepSleep() {
+  if (centralConnected) {
+    sendBuddy("{\"evt\":\"sleep\"}");
+    delay(50);
+  }
+  // "Powering down" two-tone descending beep.
+  playTone(900, 80);  delay(100);
+  playTone(500, 120); delay(140);
+
+  digitalWrite(PIN_LED, HIGH);  // LED off (active-low)
+
+  // Wait for the user to release Return / any held button before sleeping.
+  // Otherwise the held-LOW pin would immediately trigger the EXT1 ANY_LOW
+  // wake mask and the device would self-wake within milliseconds.
+  // Cap the wait so a stuck or shorted button can't lock us awake forever.
+  unsigned long releaseStart = millis();
+  while ((digitalRead(PIN_RETURN_BTN) == LOW || digitalRead(PIN_FUNC_BTN) == LOW) &&
+         millis() - releaseStart < 5000) {
+    delay(10);
+  }
+  delay(150);  // contact settle
+
+  // Configure EXT1 wake. Only arm pins that are currently HIGH — otherwise
+  // a pin that's already LOW (e.g. auto-accept switch in the ON position)
+  // immediately re-triggers ANY_LOW the moment we enter sleep.
+  // D0=GPIO1, D1=GPIO2, D2=GPIO3 — all RTC IOs on S3.
+  uint64_t wake_mask = 0;
+  if (digitalRead(PIN_FUNC_BTN)    == HIGH) { wake_mask |= (1ULL << 1); rtc_gpio_pullup_en((gpio_num_t)1); rtc_gpio_pulldown_dis((gpio_num_t)1); }
+  if (digitalRead(PIN_RETURN_BTN)  == HIGH) { wake_mask |= (1ULL << 2); rtc_gpio_pullup_en((gpio_num_t)2); rtc_gpio_pulldown_dis((gpio_num_t)2); }
+  if (digitalRead(PIN_AUTO_SWITCH) == HIGH) { wake_mask |= (1ULL << 3); rtc_gpio_pullup_en((gpio_num_t)3); rtc_gpio_pulldown_dis((gpio_num_t)3); }
+  if (wake_mask == 0) {
+    // Every input is currently LOW (shouldn't happen after release wait,
+    // but guard anyway). Force-arm Return so we can still wake.
+    wake_mask = (1ULL << 2);
+    rtc_gpio_pullup_en((gpio_num_t)2);
+    rtc_gpio_pulldown_dis((gpio_num_t)2);
+  }
+  Serial.printf("[SLEEP] wake_mask=0x%llx\n", (unsigned long long)wake_mask);
+  esp_sleep_enable_ext1_wakeup_io(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
+
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
 // ── USB serial ────────────────────────────────────────────────────────────────
 
 void serviceUsbSerial() {
@@ -335,6 +454,21 @@ void setup() {
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, HIGH);
+
+  // Seed switch state from current pin reading so the first transition is
+  // a real change, not a phantom one from the HIGH default.
+  lastSwitchState   = digitalRead(PIN_AUTO_SWITCH);
+  lastSwitchReading = lastSwitchState;
+  lastActivityMs    = millis();
+
+  // If we woke from deep sleep, log why and ignore button input until the
+  // wake-press is released — otherwise the loop sees a held Return and
+  // immediately starts the long-press-to-sleep timer all over again.
+  esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+  if (wake == ESP_SLEEP_WAKEUP_EXT1) {
+    Serial.println("[BOOT] woke from deep sleep (EXT1)");
+    ignoreButtonsUntilRelease = true;
+  }
 
   // Initialize NimBLE peripheral with NUS only.
   NimBLEDevice::init("ClaudeApprover");
@@ -368,65 +502,143 @@ void updateLED();
 void loop() {
   serviceUsbSerial();
 
-  bool funcState   = digitalRead(PIN_FUNC_BTN);
-  bool returnState = digitalRead(PIN_RETURN_BTN);
-  bool switchState = digitalRead(PIN_AUTO_SWITCH);
+  unsigned long now = millis();
+  bool funcState     = digitalRead(PIN_FUNC_BTN);
+  bool returnState   = digitalRead(PIN_RETURN_BTN);
+  bool switchReading = digitalRead(PIN_AUTO_SWITCH);
 
-  // Auto-accept switch transition
-  if (switchState != lastSwitchState) {
-    if (switchState == LOW) {
+  // After a wake-from-sleep, the wake button is still held. Skip all input
+  // processing until every button reads HIGH again, then resync state vars
+  // so the eventual release isn't interpreted as a fresh tap.
+  if (ignoreButtonsUntilRelease) {
+    if (funcState == HIGH && returnState == HIGH) {
+      lastFuncState        = HIGH;
+      lastReturnState      = HIGH;
+      lastSwitchReading    = switchReading;
+      lastSwitchState      = switchReading;
+      lastSwitchChangeMs   = now;
+      returnPressStartMs   = 0;
+      returnLongPressFired = false;
+      lastActivityMs       = now;
+      ignoreButtonsUntilRelease = false;
+    } else {
+      updateLED();
+      delay(10);
+      return;
+    }
+  }
+
+  // Auto-accept switch — debounced. Slide switch contacts bounce on flip
+  // (and a loose D2 wire flickers); without debounce we'd thrash the
+  // middleman's auto-accept timer.
+  if (switchReading != lastSwitchReading) {
+    lastSwitchReading = switchReading;
+    lastSwitchChangeMs = now;
+    Serial.printf("[SW] raw flip -> %s\n", switchReading == LOW ? "LOW" : "HIGH");
+  }
+  if (switchReading != lastSwitchState &&
+      now - lastSwitchChangeMs > switchDebounceDelay) {
+    lastSwitchState = switchReading;
+    lastActivityMs = now;
+    // Switch state DOES NOT touch LED. LED is driven by connection state
+    // and heartbeat ("Claude running" → PULSING, otherwise → SOLID).
+    if (lastSwitchState == LOW) {
       Serial.println("AUTO-ACCEPT: ON");
-      currentLEDStatus = LED_SOLID;
       emitSwitchEvent("auto_accept", "on");
-      if (pendingPromptId.length() > 0) respondPermission("once");
+      if (pendingPromptId.length() > 0) respondPermission("once", false);
     } else {
       Serial.println("AUTO-ACCEPT: OFF");
-      currentLEDStatus = LED_BREATHING;
       emitSwitchEvent("auto_accept", "off");
     }
-    lastSwitchState = switchState;
   }
 
   // Function button (press/release semantics — middleman holds modifier combo).
-  // No buzzer on button presses; LED + Claude Code state hooks do the talking.
   if (funcState == LOW && lastFuncState == HIGH &&
-      (millis() - lastFuncPress > debounceDelay)) {
-    lastFuncPress = millis();
+      (now - lastFuncPress > debounceDelay)) {
+    lastFuncPress = now;
+    lastActivityMs = now;
     Serial.println("FUNCTION pressed");
     if (pendingPromptId.length() > 0) {
-      respondPermission("once");
+      respondPermission("once");  // manual → audible
     } else {
       emitButtonEvent("function", "press");
     }
   } else if (funcState == HIGH && lastFuncState == LOW) {
     Serial.println("FUNCTION released");
+    lastActivityMs = now;
     emitButtonEvent("function", "release");
   }
   lastFuncState = funcState;
 
-  // Return button (tap semantics)
+  // Return button: short tap → Return key. Long press (≥2 s) → deep sleep.
   if (returnState == LOW && lastReturnState == HIGH &&
-      (millis() - lastReturnPress > debounceDelay)) {
-    lastReturnPress = millis();
+      (now - lastReturnPress > debounceDelay)) {
+    lastReturnPress = now;
+    returnPressStartMs = now;
+    returnLongPressFired = false;
+    lastActivityMs = now;
     Serial.println("RETURN pressed");
-    digitalWrite(PIN_LED, LOW);
-    delay(20);
-    digitalWrite(PIN_LED, HIGH);
-    emitButtonEvent("return", "tap");
+  } else if (returnState == LOW && lastReturnState == LOW &&
+             !returnLongPressFired &&
+             returnPressStartMs > 0 &&
+             now - returnPressStartMs >= RETURN_LONG_PRESS_MS) {
+    // Hold threshold reached — power off now, before user lifts the button.
+    returnLongPressFired = true;
+    Serial.println("RETURN long-press: entering deep sleep");
+    enterDeepSleep();
+  } else if (returnState == HIGH && lastReturnState == LOW) {
+    if (!returnLongPressFired) {
+      // Short tap — fire normal Return key event.
+      digitalWrite(PIN_LED, LOW);
+      delay(20);
+      digitalWrite(PIN_LED, HIGH);
+      emitButtonEvent("return", "tap");
+    }
+    returnPressStartMs = 0;
+    returnLongPressFired = false;
+    lastActivityMs = now;
   }
   lastReturnState = returnState;
 
   // Periodic battery emit
-  if (millis() - lastBatteryEmit > batteryEmitInterval) {
-    lastBatteryEmit = millis();
+  if (now - lastBatteryEmit > batteryEmitInterval) {
+    lastBatteryEmit = now;
     emitBatteryEvent();
   }
 
-  // Heartbeat watchdog
-  if (lastHeartbeatMs > 0 && millis() - lastHeartbeatMs > 30000 &&
-      currentLEDStatus != LED_BREATHING && currentLEDStatus != LED_OFF) {
+  // Diagnostic: print raw input state every 2 s. Lets you tell from the
+  // serial monitor whether the auto-accept switch is even reaching the GPIO
+  // (D2/GPIO3) when you flip it.
+  static unsigned long lastDiag = 0;
+  if (now - lastDiag > 2000) {
+    lastDiag = now;
+    Serial.printf("[IO] D0(func)=%d D1(ret)=%d D2(sw)=%d  state(sw)=%d  conn=%d\n",
+                  digitalRead(PIN_FUNC_BTN),
+                  digitalRead(PIN_RETURN_BTN),
+                  digitalRead(PIN_AUTO_SWITCH),
+                  lastSwitchState,
+                  centralConnected ? 1 : 0);
+  }
+
+  // Heartbeat watchdog: if Hardware Buddy stops sending heartbeats while
+  // BLE is still connected, drop PULSING back to SOLID (we no longer know
+  // if Claude is running, so don't keep showing the "working" animation).
+  if (centralConnected && lastHeartbeatMs > 0 &&
+      now - lastHeartbeatMs > 30000 &&
+      currentLEDStatus == LED_PULSING) {
     Serial.println("[BUDDY] heartbeat stale");
-    currentLEDStatus = LED_BREATHING;
+    currentLEDStatus = LED_SOLID;
+  }
+
+  // Idle auto-sleep. Only fires when the host is gone — if Wispr/Claude is
+  // actively connected the device stays awake regardless of physical
+  // activity, since the user might walk away mid-session and come back.
+  // Press-and-hold Return is the manual override for "off while host alive".
+  if (!centralConnected &&
+      pendingPromptId.length() == 0 &&
+      now - lastActivityMs > IDLE_SLEEP_TIMEOUT_MS) {
+    Serial.println("[SLEEP] idle timeout (no host) — entering deep sleep");
+    enterDeepSleep();
   }
 
   updateLED();
@@ -471,6 +683,7 @@ void playTone(int frequency, int duration) {
 
 void playJingle(String name) {
   if      (name == "startup")  { playTone(1000, 100); delay(120); playTone(1200, 100); delay(120); playTone(1500, 150); }
+  else if (name == "done")     { playTone(1200, 90);  delay(100); playTone(1600, 130); }
   else if (name == "approved") { playTone(800, 80);   delay(90);  playTone(1200, 120); }
   else if (name == "denied")   { playTone(1000, 80);  delay(90);  playTone(600, 120); }
   else if (name == "thinking") { playTone(1500, 50); }
