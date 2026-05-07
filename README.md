@@ -153,47 +153,29 @@ hooks entry — don't overwrite the file):
 ```json
 "hooks": {
   "UserPromptSubmit": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "curl -s -m 1 -X POST http://127.0.0.1:47823/thinking/start >/dev/null 2>&1 || true",
-          "async": true,
-          "timeout": 2
-        }
-      ]
-    }
+    { "hooks": [ { "type": "command", "command": "curl -s -m 1 -X POST http://127.0.0.1:47823/thinking/start >/dev/null 2>&1 || true", "async": true, "timeout": 2 } ] }
+  ],
+  "PreToolUse": [
+    { "hooks": [ { "type": "command", "command": "curl -s -m 1 -X POST http://127.0.0.1:47823/thinking/start >/dev/null 2>&1 || true", "async": true, "timeout": 2 } ] }
+  ],
+  "PostToolUse": [
+    { "hooks": [ { "type": "command", "command": "curl -s -m 1 -X POST http://127.0.0.1:47823/thinking/start >/dev/null 2>&1 || true", "async": true, "timeout": 2 } ] }
   ],
   "Stop": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "curl -s -m 1 -X POST http://127.0.0.1:47823/thinking/stop >/dev/null 2>&1 || true",
-          "async": true,
-          "timeout": 2
-        }
-      ]
-    }
+    { "hooks": [ { "type": "command", "command": "curl -s -m 1 -X POST http://127.0.0.1:47823/thinking/stop >/dev/null 2>&1 || true", "async": true, "timeout": 2 } ] }
   ],
   "StopFailure": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "curl -s -m 1 -X POST http://127.0.0.1:47823/thinking/stop >/dev/null 2>&1 || true",
-          "async": true,
-          "timeout": 2
-        }
-      ]
-    }
+    { "hooks": [ { "type": "command", "command": "curl -s -m 1 -X POST http://127.0.0.1:47823/thinking/stop >/dev/null 2>&1 || true", "async": true, "timeout": 2 } ] }
   ]
 }
 ```
 
-`UserPromptSubmit` fires the moment you hit Enter; `Stop` / `StopFailure`
-fire when the assistant turn ends. The device pulses while Claude is
-thinking and beeps when it goes back to solid.
+`UserPromptSubmit` / `PreToolUse` / `PostToolUse` all hit `/thinking/start`,
+which cancels any pending "done" timer and keeps the LED pulsing. `Stop` /
+`StopFailure` hit `/thinking/stop`, which schedules a 1.5 s deferred beep.
+Claude Code fires `Stop` after every text-then-tool segment in an agent
+turn, not just at the end, so the debounce is what guarantees only the
+final Stop survives the window and triggers the LED-solid + done jingle.
 
 ## MCP shim (`mcp-server/`)
 
