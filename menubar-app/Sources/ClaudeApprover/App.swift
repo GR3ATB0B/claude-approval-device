@@ -39,13 +39,20 @@ final class Bridge: ObservableObject {
     @Published var httpRunning: Bool = false
     @Published var autoAcceptOn: Bool = false  // software toggle, bypasses broken D2 switch
 
-    // Deferred "done" beep. Claude Code fires Stop hooks multiple times per
-    // turn (after each text-then-tool segment). We only want one beep at the
-    // very end, so /thinking/stop schedules this; /thinking/start (or the
-    // PreToolUse hook firing on the next tool) cancels it. If nothing
-    // cancels it within the window, the turn is truly done — beep + solid.
+    // Idle-timer "done" beep. Every Claude Code lifecycle hook calls
+    // /thinking/start, which resets this timer and sets LED → pulsing.
+    // When the timer survives the full window with no resets, the turn
+    // is truly done: LED → solid + done jingle. /thinking/stop is kept
+    // as an alias for /thinking/start to handle legacy hook configs.
     private var pendingDoneTimer: Timer?
-    private static let doneDebounceSeconds: TimeInterval = 1.5
+    private var lastSentLedMode: String = ""  // skip redundant BLE writes
+    private static let doneDebounceSeconds: TimeInterval = 4.0
+
+    private func sendLedIfChanged(_ mode: String) {
+        if mode == lastSentLedMode { return }
+        lastSentLedMode = mode
+        ble.send(["cmd": "led", "mode": mode])
+    }
 
     init() {
         hasAccessibility = EventInjector.ensureAccessibility(prompt: false)
@@ -84,18 +91,13 @@ final class Bridge: ObservableObject {
         case ("POST", "/jingle"):
             ble.send(["cmd": "jingle", "name": json["name"] as? String ?? "startup"])
             return (200, jsonData(["ok": true]))
-        case ("POST", "/thinking/start"):
-            // Spinner on. Cancel any pending deferred beep (we're not done
-            // yet — this fires from UserPromptSubmit and PreToolUse).
-            cancelPendingDone()
-            ble.send(["cmd": "led", "mode": "pulsing"])
-            return (200, jsonData(["ok": true]))
-        case ("POST", "/thinking/stop"):
-            // Possibly-end-of-turn. Don't beep yet — schedule a deferred
-            // beep. If another /thinking/start arrives within the window
-            // (next tool fires), the timer is cancelled. Only the truly
-            // final Stop survives the window and triggers LED solid + beep.
-            scheduleDeferredDone()
+        case ("POST", "/thinking/start"), ("POST", "/thinking/stop"):
+            // Every Claude Code hook (UserPromptSubmit, PreToolUse,
+            // PostToolUse, Stop, StopFailure) hits this. Each call resets
+            // the idle timer and sets LED → pulsing. The beep only fires
+            // if the timer expires (no further hook fires for the full
+            // window) — i.e. the turn is truly idle.
+            keepAlive()
             return (200, jsonData(["ok": true]))
         case ("POST", "/tone"):
             let freq = json["freq"] as? Int ?? 1000
@@ -124,21 +126,15 @@ final class Bridge: ObservableObject {
         hasAccessibility = EventInjector.ensureAccessibility(prompt: true)
     }
 
-    private func cancelPendingDone() {
-        DispatchQueue.main.async { [weak self] in
-            self?.pendingDoneTimer?.invalidate()
-            self?.pendingDoneTimer = nil
-        }
-    }
-
-    private func scheduleDeferredDone() {
+    private func keepAlive() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.pendingDoneTimer?.invalidate()
+            self.sendLedIfChanged("pulsing")
             let t = Timer(timeInterval: Bridge.doneDebounceSeconds, repeats: false) { [weak self] _ in
                 guard let self else { return }
-                NSLog("[Bridge] deferred-done timer fired → LED solid + done jingle")
-                self.ble.send(["cmd": "led", "mode": "solid"])
+                NSLog("[Bridge] idle window expired → LED solid + done jingle")
+                self.sendLedIfChanged("solid")
                 self.ble.send(["cmd": "jingle", "name": "done"])
                 self.pendingDoneTimer = nil
             }

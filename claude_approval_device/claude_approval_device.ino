@@ -84,7 +84,7 @@ const unsigned long switchDebounceDelay = 50;
 // Return long-press → enter deep sleep (firmware-level power off).
 unsigned long returnPressStartMs = 0;
 bool returnLongPressFired = false;
-const unsigned long RETURN_LONG_PRESS_MS = 2000;
+const unsigned long RETURN_LONG_PRESS_MS = 3000;  // 3 s — accidental 2 s hits were sleeping the device
 
 // Auto-sleep: device drops to deep sleep after this much inactivity.
 // Any button or the auto-accept switch (EXT1 wake on D0/D1/D2 LOW) brings it back.
@@ -660,9 +660,10 @@ void updateLED() {
         lastLEDUpdate = now;
       } break;
     case LED_PULSING:
-      if (now - lastLEDUpdate > 8) {
-        if (ledDirection) { ledBrightness += 10; if (ledBrightness >= 255) { ledBrightness = 255; ledDirection = false; } }
-        else              { ledBrightness -= 10; if (ledBrightness <= 50)  { ledBrightness = 50;  ledDirection = true;  } }
+      // Slow, smooth pulse — "thinking" cue, not a strobe.
+      if (now - lastLEDUpdate > 18) {
+        if (ledDirection) { ledBrightness += 4; if (ledBrightness >= 255) { ledBrightness = 255; ledDirection = false; } }
+        else              { ledBrightness -= 4; if (ledBrightness <= 60)  { ledBrightness = 60;  ledDirection = true;  } }
         analogWrite(PIN_LED, 255 - ledBrightness);
         lastLEDUpdate = now;
       } break;
