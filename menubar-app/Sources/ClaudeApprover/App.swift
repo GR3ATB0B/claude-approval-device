@@ -186,6 +186,19 @@ struct MenuView: View {
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }
+            if let pct = bridge.ble.batteryPercent {
+                HStack(spacing: 4) {
+                    Image(systemName: batteryIcon(for: pct))
+                        .foregroundStyle(batteryColor(for: pct))
+                    Text("\(pct)%")
+                        .font(.caption.monospaced().bold())
+                    if let mv = bridge.ble.batteryMillivolts {
+                        Text("(\(String(format: "%.2f", Double(mv) / 1000.0)) V)")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
             if !bridge.ble.lastIncomingLine.isEmpty {
                 Text("last: \(bridge.ble.lastIncomingLine)")
                     .font(.caption.monospaced())
@@ -236,6 +249,24 @@ struct MenuView: View {
         }
         .padding(12)
         .frame(width: 260)
+    }
+
+    private func batteryIcon(for pct: Int) -> String {
+        switch pct {
+        case 80...:    return "battery.100"
+        case 60..<80:  return "battery.75"
+        case 40..<60:  return "battery.50"
+        case 20..<40:  return "battery.25"
+        default:       return "battery.0"
+        }
+    }
+
+    private func batteryColor(for pct: Int) -> Color {
+        switch pct {
+        case 30...: return .green
+        case 15..<30: return .orange
+        default: return .red
+        }
     }
 
     private var statusColor: Color {

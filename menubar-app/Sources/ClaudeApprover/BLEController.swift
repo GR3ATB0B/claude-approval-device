@@ -30,6 +30,8 @@ final class BLEController: NSObject, ObservableObject {
     @Published private(set) var status: BLEStatus = .unknown
     @Published private(set) var lastIncomingLine: String = ""
     @Published private(set) var deviceIdentifier: UUID?
+    @Published private(set) var batteryPercent: Int?
+    @Published private(set) var batteryMillivolts: Int?
 
     /// Hook called on every parsed JSON event from the device.
     var onEvent: (([String: Any]) -> Void)?
@@ -219,6 +221,19 @@ extension BLEController: CBPeripheralDelegate {
             let any = try? JSONSerialization.jsonObject(with: data),
             let obj = any as? [String: Any]
         else { return }
+        // Capture battery readings from periodic emits + status acks.
+        if (obj["evt"] as? String) == "battery" {
+            DispatchQueue.main.async {
+                self.batteryPercent = obj["pct"] as? Int
+                self.batteryMillivolts = obj["mV"] as? Int
+            }
+        } else if let ackData = obj["data"] as? [String: Any],
+                  let bat = ackData["bat"] as? [String: Any] {
+            DispatchQueue.main.async {
+                self.batteryPercent = bat["pct"] as? Int
+                self.batteryMillivolts = bat["mV"] as? Int
+            }
+        }
         onEvent?(obj)
     }
 }

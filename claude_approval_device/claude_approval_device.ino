@@ -37,6 +37,10 @@
 #define PIN_RETURN_BTN  D1
 #define PIN_AUTO_SWITCH D2
 #define PIN_BUZZER      D5
+// Battery sense — XIAO ESP32-S3 v1.0 has an internal 200k+200k divider from
+// BAT+ to D9 (GPIO8). Older revisions don't; wire an external 100k+100k
+// divider from BAT+ to D9 to GND. Either way the ADC reads ~half battery V.
+#define PIN_BATTERY     D9
 #define PIN_LED         D8
 
 // ── BLE NUS UUIDs ────────────────────────────────────────────────────────────
@@ -78,6 +82,26 @@ String deviceName = "Clawd";
 String ownerName  = "";
 uint32_t apprCount = 0, denyCount = 0;
 unsigned long bootMs = 0;
+
+// Battery sense
+unsigned long lastBatteryEmit = 0;
+const unsigned long batteryEmitInterval = 30000;  // 30 s
+
+float readBatteryVoltage() {
+  // ESP32 ADC is 12-bit (0..4095) referenced to ~3.3V. Divider is 2:1.
+  int raw = analogRead(PIN_BATTERY);
+  float v_pin = (raw / 4095.0f) * 3.3f;
+  return v_pin * 2.0f;  // back-out divider
+}
+
+int readBatteryPercent() {
+  float v = readBatteryVoltage();
+  // Map 3.0V -> 0 %, 4.2V -> 100 %.
+  float pct = (v - 3.0f) / (4.2f - 3.0f) * 100.0f;
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  return (int)pct;
+}
 
 // USB serial command buffer (same JSON protocol over USB CDC)
 String usbBuffer = "";
@@ -141,6 +165,15 @@ void emitHello() {
   sendBuddy(s);
 }
 
+void emitBatteryEvent() {
+  JsonDocument d;
+  d["evt"] = "battery";
+  d["pct"] = readBatteryPercent();
+  d["mV"] = (int)(readBatteryVoltage() * 1000.0f);
+  String s; serializeJson(d, s);
+  sendBuddy(s);
+}
+
 void emitButtonEvent(const char* id, const char* action) {
   JsonDocument d;
   d["evt"] = "button";
@@ -187,6 +220,9 @@ void handleStatusCmd(JsonDocument& doc) {
   JsonObject stats = d["stats"].to<JsonObject>();
   stats["appr"] = apprCount;
   stats["deny"] = denyCount;
+  JsonObject bat = d["bat"].to<JsonObject>();
+  bat["pct"] = readBatteryPercent();
+  bat["mV"] = (int)(readBatteryVoltage() * 1000.0f);
   String s; serializeJson(resp, s);
   sendBuddy(s);
 }
@@ -341,37 +377,29 @@ void loop() {
     if (switchState == LOW) {
       Serial.println("AUTO-ACCEPT: ON");
       currentLEDStatus = LED_SOLID;
-      playTone(1000, 100);
       emitSwitchEvent("auto_accept", "on");
-      // If a Buddy prompt is already pending, approve immediately
       if (pendingPromptId.length() > 0) respondPermission("once");
     } else {
       Serial.println("AUTO-ACCEPT: OFF");
       currentLEDStatus = LED_BREATHING;
-      playTone(800, 50);
-      delay(100);
-      playTone(800, 50);
       emitSwitchEvent("auto_accept", "off");
     }
     lastSwitchState = switchState;
   }
 
-  // Function button (press/release semantics — middleman holds modifier combo)
+  // Function button (press/release semantics — middleman holds modifier combo).
+  // No buzzer on button presses; LED + Claude Code state hooks do the talking.
   if (funcState == LOW && lastFuncState == HIGH &&
       (millis() - lastFuncPress > debounceDelay)) {
     lastFuncPress = millis();
     Serial.println("FUNCTION pressed");
-    playTone(1200, 50);
     if (pendingPromptId.length() > 0) {
-      // Buddy mode: send permission decision
       respondPermission("once");
     } else {
-      // Normal mode: tell middleman to inject Wispr Flow combo
       emitButtonEvent("function", "press");
     }
   } else if (funcState == HIGH && lastFuncState == LOW) {
     Serial.println("FUNCTION released");
-    playTone(1000, 50);
     emitButtonEvent("function", "release");
   }
   lastFuncState = funcState;
@@ -381,13 +409,18 @@ void loop() {
       (millis() - lastReturnPress > debounceDelay)) {
     lastReturnPress = millis();
     Serial.println("RETURN pressed");
-    playTone(1500, 80);
     digitalWrite(PIN_LED, LOW);
     delay(20);
     digitalWrite(PIN_LED, HIGH);
     emitButtonEvent("return", "tap");
   }
   lastReturnState = returnState;
+
+  // Periodic battery emit
+  if (millis() - lastBatteryEmit > batteryEmitInterval) {
+    lastBatteryEmit = millis();
+    emitBatteryEvent();
+  }
 
   // Heartbeat watchdog
   if (lastHeartbeatMs > 0 && millis() - lastHeartbeatMs > 30000 &&
