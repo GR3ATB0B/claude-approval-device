@@ -46,7 +46,9 @@ final class Bridge: ObservableObject {
     // as an alias for /thinking/start to handle legacy hook configs.
     private var pendingDoneTimer: Timer?
     private var lastSentLedMode: String = ""  // skip redundant BLE writes
-    private static let doneDebounceSeconds: TimeInterval = 4.0
+    private var lastDoneFiredAt: Date = .distantPast
+    private static let doneDebounceSeconds: TimeInterval = 6.0  // idle window
+    private static let stopDuplicateWindowSeconds: TimeInterval = 2.0  // duplicate-beep guard
 
     private func sendLedIfChanged(_ mode: String) {
         if mode == lastSentLedMode { return }
@@ -91,13 +93,17 @@ final class Bridge: ObservableObject {
         case ("POST", "/jingle"):
             ble.send(["cmd": "jingle", "name": json["name"] as? String ?? "startup"])
             return (200, jsonData(["ok": true]))
-        case ("POST", "/thinking/start"), ("POST", "/thinking/stop"):
-            // Every Claude Code hook (UserPromptSubmit, PreToolUse,
-            // PostToolUse, Stop, StopFailure) hits this. Each call resets
-            // the idle timer and sets LED → pulsing. The beep only fires
-            // if the timer expires (no further hook fires for the full
-            // window) — i.e. the turn is truly idle.
-            keepAlive()
+        case ("POST", "/thinking/start"):
+            startThinking()
+            return (200, jsonData(["ok": true]))
+        case ("POST", "/thinking/stop"):
+            stopThinking()
+            return (200, jsonData(["ok": true]))
+        case ("POST", "/notification"):
+            // Notification hook payload includes a `message` field. Some
+            // messages are real "needs your input" prompts; others are
+            // auto-mode classifier chatter. Beep only on real prompts.
+            handleNotification(json)
             return (200, jsonData(["ok": true]))
         case ("POST", "/tone"):
             let freq = json["freq"] as? Int ?? 1000
@@ -126,20 +132,72 @@ final class Bridge: ObservableObject {
         hasAccessibility = EventInjector.ensureAccessibility(prompt: true)
     }
 
-    private func keepAlive() {
+    /// Called by every Claude Code lifecycle hook (UserPromptSubmit,
+    /// PreToolUse, PostToolUse, Stop, StopFailure, Notification). Each
+    /// call resets the idle timer and sets LED pulsing. The beep + LED
+    /// solid only fires after the full window passes with zero further
+    /// hook calls — i.e. the turn is truly done.
+    private func startThinking() {
+        NSLog("[Bridge] /thinking/start (resets idle timer)")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.pendingDoneTimer?.invalidate()
             self.sendLedIfChanged("pulsing")
             let t = Timer(timeInterval: Bridge.doneDebounceSeconds, repeats: false) { [weak self] _ in
                 guard let self else { return }
-                NSLog("[Bridge] idle window expired → LED solid + done jingle")
+                let now = Date()
+                if now.timeIntervalSince(self.lastDoneFiredAt) < Bridge.stopDuplicateWindowSeconds {
+                    NSLog("[Bridge] idle timer fired but recently beeped — suppressed")
+                    return
+                }
+                self.lastDoneFiredAt = now
+                NSLog("[Bridge] idle timer expired → LED solid + done jingle")
                 self.sendLedIfChanged("solid")
                 self.ble.send(["cmd": "jingle", "name": "done"])
                 self.pendingDoneTimer = nil
             }
             RunLoop.main.add(t, forMode: .common)
             self.pendingDoneTimer = t
+        }
+    }
+
+    /// Legacy alias. Some hook configs may still call this; treat it
+    /// like /thinking/start so behavior stays identical either way.
+    private func stopThinking() {
+        startThinking()
+    }
+
+    /// Notification hook payload router. Claude Code sends a JSON body
+    /// with a `message` field. Real "needs your input" prompts say
+    /// things like "Claude is waiting for your input". Auto-mode
+    /// classifier chatter says things like "Permission auto-granted".
+    /// Beep only on the former; reset idle timer on the latter.
+    private func handleNotification(_ payload: [String: Any]) {
+        let message = (payload["message"] as? String) ?? ""
+        NSLog("[Bridge] /notification message=\(message)")
+        let lower = message.lowercased()
+        let isRealAttention =
+            lower.contains("waiting for") ||
+            lower.contains("needs your") ||
+            lower.contains("permission") && !lower.contains("auto")
+        if isRealAttention {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let now = Date()
+                if now.timeIntervalSince(self.lastDoneFiredAt) < Bridge.stopDuplicateWindowSeconds {
+                    NSLog("[Bridge] notification beep suppressed (duplicate)")
+                    return
+                }
+                self.lastDoneFiredAt = now
+                NSLog("[Bridge] notification → immediate done jingle")
+                self.pendingDoneTimer?.invalidate()
+                self.pendingDoneTimer = nil
+                self.sendLedIfChanged("solid")
+                self.ble.send(["cmd": "jingle", "name": "done"])
+            }
+        } else {
+            // Not a real attention event — just reset idle state.
+            startThinking()
         }
     }
 
