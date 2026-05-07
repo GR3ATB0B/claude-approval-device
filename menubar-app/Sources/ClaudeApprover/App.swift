@@ -39,6 +39,14 @@ final class Bridge: ObservableObject {
     @Published var httpRunning: Bool = false
     @Published var autoAcceptOn: Bool = false  // software toggle, bypasses broken D2 switch
 
+    // Deferred "done" beep. Claude Code fires Stop hooks multiple times per
+    // turn (after each text-then-tool segment). We only want one beep at the
+    // very end, so /thinking/stop schedules this; /thinking/start (or the
+    // PreToolUse hook firing on the next tool) cancels it. If nothing
+    // cancels it within the window, the turn is truly done — beep + solid.
+    private var pendingDoneTimer: Timer?
+    private static let doneDebounceSeconds: TimeInterval = 1.5
+
     init() {
         hasAccessibility = EventInjector.ensureAccessibility(prompt: false)
         ble.onEvent = { [weak self] obj in self?.handle(obj) }
@@ -77,13 +85,17 @@ final class Bridge: ObservableObject {
             ble.send(["cmd": "jingle", "name": json["name"] as? String ?? "startup"])
             return (200, jsonData(["ok": true]))
         case ("POST", "/thinking/start"):
-            // Claude Code hook: user just submitted a prompt → spinner is on.
+            // Spinner on. Cancel any pending deferred beep (we're not done
+            // yet — this fires from UserPromptSubmit and PreToolUse).
+            cancelPendingDone()
             ble.send(["cmd": "led", "mode": "pulsing"])
             return (200, jsonData(["ok": true]))
         case ("POST", "/thinking/stop"):
-            // Claude Code hook: assistant finished → spinner gone, beep + solid.
-            ble.send(["cmd": "led", "mode": "solid"])
-            ble.send(["cmd": "jingle", "name": "done"])
+            // Possibly-end-of-turn. Don't beep yet — schedule a deferred
+            // beep. If another /thinking/start arrives within the window
+            // (next tool fires), the timer is cancelled. Only the truly
+            // final Stop survives the window and triggers LED solid + beep.
+            scheduleDeferredDone()
             return (200, jsonData(["ok": true]))
         case ("POST", "/tone"):
             let freq = json["freq"] as? Int ?? 1000
@@ -110,6 +122,29 @@ final class Bridge: ObservableObject {
 
     func requestAccessibility() {
         hasAccessibility = EventInjector.ensureAccessibility(prompt: true)
+    }
+
+    private func cancelPendingDone() {
+        DispatchQueue.main.async { [weak self] in
+            self?.pendingDoneTimer?.invalidate()
+            self?.pendingDoneTimer = nil
+        }
+    }
+
+    private func scheduleDeferredDone() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.pendingDoneTimer?.invalidate()
+            let t = Timer(timeInterval: Bridge.doneDebounceSeconds, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                NSLog("[Bridge] deferred-done timer fired → LED solid + done jingle")
+                self.ble.send(["cmd": "led", "mode": "solid"])
+                self.ble.send(["cmd": "jingle", "name": "done"])
+                self.pendingDoneTimer = nil
+            }
+            RunLoop.main.add(t, forMode: .common)
+            self.pendingDoneTimer = t
+        }
     }
 
     /// Software auto-accept toggle. The physical D2 switch is unreliable
